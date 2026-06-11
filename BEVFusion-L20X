@@ -1,0 +1,380 @@
+# BEVFusion L20X (sm_90) 部署与训练指南
+
+本文档记录在 **NVIDIA L20X (sm_90)** 上从零跑通 BEVFusion **Camera+LiDAR 融合检测** 的完整流程，以及实际踩过的坑与对应修复。
+
+> 验证环境：4× L20X、Driver 550、Conda 环境 `bevfusion`、工作目录 `/mnt/wfy/bevfusion`
+
+---
+
+## 目录
+
+1. [整体流程概览](#1-整体流程概览)
+2. [环境安装](#2-环境安装)
+3. [代码改动说明](#3-代码改动说明)
+4. [数据准备](#4-数据准备)
+5. [预训练权重](#5-预训练权重)
+6. [Val 评测](#6-val-评测)
+7. [训练](#7-训练)
+8. [踩坑汇总](#8-踩坑汇总)
+9. [常见问题](#9-常见问题)
+
+---
+
+## 1. 整体流程概览
+
+```
+环境升级 (PyTorch 2.1 + sm_90)
+    ↓
+编译 mmdet3d / 修补 mmcv
+    ↓
+准备 nuScenes 数据 + GT Database
+    ↓
+下载预训练权重
+    ↓
+Val 冒烟（单卡 test.py）→ 确认 mAP/NDS 对齐
+    ↓
+4 卡训练（train.py）→ 6 epoch
+    ↓
+用 epoch_6.pth 再跑 test.py 评测
+```
+
+**已验证的 Val 结果**（`bevfusion-det.pth`，6019 帧）：
+
+| 指标 | 本次结果 | README 官方 |
+|------|----------|-------------|
+| mAP  | 68.64%   | 68.52%      |
+| NDS  | 71.47%   | 71.38%      |
+
+偏差约 0.1 个百分点，属正常数值误差，可认为复现成功。
+
+---
+
+## 2. 环境安装
+
+原始 Docker/conda 环境基于 **PyTorch 1.10 + cu113**，**不支持 sm_90**，GPU 上会卡住或报 `no kernel image`。
+
+### 2.1 推荐版本
+
+| 组件 | 版本 |
+|------|------|
+| Python | 3.8 |
+| PyTorch | **2.1.2+cu121** |
+| mmcv-full | **1.7.2**（cu121/torch2.1 wheel） |
+| mmdet | **2.28.2** |
+| mmdet3d | 本仓库源码 `python setup.py develop` 重编译 |
+
+### 2.2 编译 mmdet3d
+
+```bash
+conda activate bevfusion
+cd /mnt/wfy/bevfusion
+
+# Conda 内安装 CUDA 编译工具链（若缺失）
+conda install -y cuda-nvcc=12.1 cuda-cudart-dev libcusparse-dev libcublas-dev libcusolver-dev
+
+# 重编译（含 sm_90 前向兼容 PTX）
+FORCE_CUDA=1 \
+TORCH_CUDA_ARCH_LIST="8.6+PTX" \
+CUDA_HOME=$CONDA_PREFIX \
+python setup.py develop
+```
+
+`setup.py` 中已增加 `-gencode=arch=compute_86,code=compute_86`（PTX），使自定义 CUDA 算子在 sm_90 上可通过 JIT 运行。
+
+### 2.3 mmcv site-packages 补丁（必做）
+
+PyTorch 2.1 与 mmcv 1.7 存在 API 差异，需手动 patch：
+
+**`mmcv/parallel/distributed.py`**（约 159 行）：
+
+```python
+# PyTorch >= 2.1 移除了 _use_replicated_tensor_module
+getattr(self, '_use_replicated_tensor_module', False)
+```
+
+**`mmcv/parallel/_functions.py`**（约 76 行）：
+
+```python
+_get_stream(torch.device('cuda', device))  # 原为 _get_stream(device)
+```
+
+---
+
+## 3. 代码改动说明
+
+以下为仓库内 **git 可追踪** 的改动及原因。
+
+| 文件 | 改动 | 原因 |
+|------|------|------|
+| `setup.py` | 增加 8.6 PTX；注册 `feature_decorator_ext` | sm_90 JIT；补全 CUDA 扩展 |
+| `mmdet3d/ops/spconv/conv.py` | `@register_module(force=True)` | mmcv 1.7 与 mmdet3d SparseConv 注册冲突 |
+| `mmdet3d/models/vtransforms/depth_lss.py` | `add_depth_features=False`；`get_cam_feats(..., mats_dict=None)` | depth 通道不匹配；函数签名与父类不一致 |
+| `mmdet3d/datasets/pipelines/dbsampler.py` | `info.get("difficulty", 0)` | 部分 dbinfos 无 `difficulty` 字段 |
+| `tools/test.py` | 单卡不用 DDP；默认禁 cuDNN/FP16 推理 | L20X cuDNN 算法选择失败；DDP 兼容 |
+| `tools/train.py` | 默认禁 cuDNN；启动时 `apply_sm90_patches()` | 同上；FocalLoss CUDA 算子无 sm_90 |
+| `mmdet3d/utils/sm90_compat.py` | **新增** sm_90 训练兼容补丁 | `sigmoid_focal_loss` 回退 PyTorch 实现 |
+
+其他小改：`feature_decorator.cpp`（int→int64_t）、`radar_encoder.py`（去掉 flash_attn 依赖）等。
+
+---
+
+## 4. 数据准备
+
+### 4.1 目录结构
+
+```
+data/nuscenes/
+├── v1.0-trainval/          # nuScenes 元数据 JSON
+├── samples/                # 图像、点云等
+├── sweeps/
+├── maps/
+├── nuscenes_infos_train.pkl    # 训练样本索引（必须）
+├── nuscenes_infos_val.pkl      # 验证样本索引（必须）
+├── nuscenes_dbinfos_train.pkl  # ObjectPaste 增强库（训练必须）
+└── nuscenes_gt_database/       # GT Database 点云片段（训练必须）
+```
+
+### 4.2 两类 pkl 的区别（易混淆）
+
+| 文件 | 用途 |
+|------|------|
+| `nuscenes_infos_train.pkl` | **训练帧列表**：每帧路径、标定、3D 标注，供 DataLoader 读取 |
+| `nuscenes_dbinfos_train.pkl` | **GT Database**：ObjectPaste 从库里抠物体贴到场景，是数据增强用的**另一套索引** |
+
+有 `infos_train.pkl` **不能替代** `dbinfos_train.pkl`。
+
+### 4.3 生成命令
+
+```bash
+conda activate bevfusion
+cd /mnt/wfy/bevfusion
+
+python tools/create_data.py nuscenes \
+  --root-path ./data/nuscenes \
+  --out-dir ./data/nuscenes \
+  --extra-tag nuscenes \
+  --version v1.0
+```
+
+耗时较长（数小时），会生成：
+
+- `nuscenes_infos_train.pkl` / `nuscenes_infos_val.pkl`
+- `nuscenes_dbinfos_train.pkl`
+- `nuscenes_gt_database/` 目录
+
+> **注意**：若之前对 `nuscenes_dbinfos_train.pkl` 建过软链，请先删除软链再跑 `create_data.py`，否则新文件会写到软链目标上。
+
+---
+
+## 5. 预训练权重
+
+统一放在 `pretrained/` 目录：
+
+| 文件 | 下载地址 | 用途 |
+|------|----------|------|
+| `bevfusion-det.pth` | [Dropbox](https://www.dropbox.com/scl/fi/ulaz9z4wdwtypjhx7xdi3/bevfusion-det.pth?rlkey=ovusfi2rchjub5oafogou255v&dl=1) | **Val 评测**（最终融合模型） |
+| `lidar-only-det.pth` | [Dropbox](https://www.dropbox.com/scl/fi/b1zvgrg9ucmv0wtx6pari/lidar-only-det.pth?rlkey=fw73bmdh57jxtudw6osloywah&dl=1) | **训练** `--load_from`，初始化 LiDAR 分支 |
+| `swint-nuimages-pretrained.pth` | [Dropbox](https://www.dropbox.com/scl/fi/f3e67wgn2omoftah4ceri/swint-nuimages-pretrained.pth?rlkey=k9kafympye80b3b1quutti4yq&dl=1) | **训练** 相机 Swin backbone 初始化（推荐） |
+
+也可一键下载：
+
+```bash
+./tools/download_pretrained.sh
+```
+
+Swin ImageNet 备用权重（配置默认）：  
+`~/.cache/torch/hub/checkpoints/swin_tiny_patch4_window7_224.pth`
+
+加载 `lidar-only-det.pth` 时出现大量 `missing keys`（camera/fuser 部分）是**正常现象**，相机由 Swin 预训练、融合层随机初始化。
+
+---
+
+## 6. Val 评测
+
+### 6.1 单卡命令
+
+```bash
+conda activate bevfusion
+cd /mnt/wfy/bevfusion
+
+torchpack dist-run -np 1 python tools/test.py \
+  configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+  pretrained/bevfusion-det.pth \
+  --eval bbox
+```
+
+### 6.2 默认行为（L20X 兼容）
+
+`tools/test.py` 已做以下默认设置，**无需额外参数**：
+
+- `disable_cudnn=True`：规避 cuDNN `FIND/GET was unable to find an engine`
+- 不启用 FP16 推理（除非 `--cfg-options use_fp16_inference=True`）
+- 单卡走 `MMDataParallel`，多卡才走 DDP
+
+### 6.3 恢复官方行为（其他 GPU）
+
+```bash
+# 启用 cuDNN
+--cfg-options disable_cudnn=False
+
+# 启用 FP16 推理
+--cfg-options use_fp16_inference=True
+```
+
+---
+
+## 7. 训练
+
+### 7.1 4 卡 Camera+LiDAR 融合训练
+
+```bash
+conda activate bevfusion
+cd /mnt/wfy/bevfusion
+
+torchpack dist-run -np 4 python tools/train.py \
+  configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+  --model.encoders.camera.backbone.init_cfg.checkpoint pretrained/swint-nuimages-pretrained.pth \
+  --load_from pretrained/lidar-only-det.pth
+```
+
+### 7.2 训练参数
+
+| 项 | 值 |
+|----|-----|
+| 配置 | `convfuser.yaml` |
+| Epoch | 6 |
+| Batch | 4 GPU × 4 samples/GPU = 16 |
+| 优化器 | AdamW, lr=2e-4 |
+| 日志/权重 | `runs/run-xxxxxxxx/` |
+
+### 7.3 训练结束后评测
+
+```bash
+torchpack dist-run -np 1 python tools/test.py \
+  configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+  runs/run-xxxxxxxx/epoch_6.pth \
+  --eval bbox
+```
+
+### 7.4 后台运行示例
+
+```bash
+nohup torchpack dist-run -np 4 python tools/train.py \
+  configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+  --model.encoders.camera.backbone.init_cfg.checkpoint pretrained/swint-nuimages-pretrained.pth \
+  --load_from pretrained/lidar-only-det.pth \
+  > /tmp/bevfusion_train.log 2>&1 &
+
+tail -f /tmp/bevfusion_train.log
+```
+
+---
+
+## 8. 踩坑汇总
+
+### 8.1 环境与 GPU
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| GPU 计算卡住 / 无 sm_90 | PyTorch 1.10 不支持 Hopper | 升级到 PyTorch 2.1.2+cu121 |
+| `no kernel image is available` | mmcv/mmdet3d CUDA 算子无 sm_90 内核 | 重编译 mmdet3d；FocalLoss 回退 PyTorch |
+| `SparseConv` 注册冲突 | mmcv 1.7 自带同名类 | `force=True` 覆盖注册 |
+| DDP `_use_replicated_tensor_module` | PyTorch 2.1 API 变更 | patch `mmcv/parallel/distributed.py` |
+
+### 8.2 Val 推理
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `FIND was unable to find an engine` | L20X + cuDNN + FP16 conv | 默认 `disable_cudnn=True`，关闭 FP16 推理 |
+| `get_cam_feats() takes 3 positional arguments but 4 were given` | `depth_lss.py` 签名与父类不一致 | 增加 `mats_dict=None` 参数 |
+| `expected input 1 channels, but got 6` | `add_depth_features=True` 默认开启 | `DepthLSSTransform` 传 `add_depth_features=False` |
+| 权重 0 字节 | 下载中断 | 重新下载 `bevfusion-det.pth` |
+
+### 8.3 训练
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `KeyError: 'difficulty'` | dbinfos 格式不含 `difficulty` | `dbsampler.py` 用 `.get("difficulty", 0)`；或重跑 `create_data.py` |
+| `sigmoid_focal_loss` CUDA 报错 | mmcv 预编译 wheel 无 sm_90 | `sm90_compat.py` + patch `mmdet/focal_loss.py` |
+| `missing keys` 加载 lidar-only | 仅 LiDAR 权重，无 camera | **正常**，camera 由 Swin 预训练加载 |
+| 训练很慢 | 默认禁用 cuDNN | 可尝试 `disable_cudnn=False`，需先冒烟几十个 iter |
+
+### 8.4 数据
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| 有 `infos_train.pkl` 仍报 dbinfos 缺失 | 两个文件用途不同 | 生成或软链 `nuscenes_dbinfos_train.pkl` |
+| 软链导致 create_data 写错文件 | 软链指向旧 10sweeps 文件 | 删除软链后重新 `create_data.py` |
+
+---
+
+## 9. 常见问题
+
+### Q: 禁用 cuDNN 有什么影响？
+
+**目的**：cuDNN 在 L20X 上部分 conv 算法选择会失败。  
+**后果**：推理/训练变慢（可能接近 2×），但**精度几乎无影响**（Val 已验证对齐）。  
+环境升级或驱动更新后可尝试 `--cfg-options disable_cudnn=False` 恢复加速。
+
+### Q: 为什么 Val 不用 FP16？
+
+FP16 + cuDNN 在 sm_90 上触发 `FIND/GET` 错误。FP32 推理结果与官方一致。若需 FP16，须同时解决 cuDNN 兼容性。
+
+### Q: torchpack 配置怎么覆盖？
+
+本仓库用 torchpack 递归加载 yaml，**不能**直接用 `Config.fromfile`。命令行覆盖示例：
+
+```bash
+--cfg-options disable_cudnn=False max_epochs=1
+```
+
+### Q: 多卡 Val 怎么跑？
+
+```bash
+torchpack dist-run -np 4 python tools/test.py ... 
+```
+
+需确保 mmcv DDP 补丁已应用；单卡 Val 已充分验证，推荐调试阶段用单卡。
+
+### Q: 如何确认环境 OK？
+
+```bash
+# 1. GPU sm_90 可用
+python -c "import torch; x=torch.randn(2,2,device='cuda'); print(x@x)"
+
+# 2. 单 batch 前向
+# （参考 val 日志，首个 batch 无报错即可）
+
+# 3. FocalLoss sm_90
+python -c "
+from mmdet.models.losses import FocalLoss
+import torch
+f=FocalLoss(use_sigmoid=True); p=torch.randn(4,10,device='cuda'); t=torch.randint(0,10,(4,),device='cuda')
+print(f(p,t))
+"
+```
+
+---
+
+## 附录：关键文件速查
+
+```
+/mnt/wfy/bevfusion/
+├── configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml
+├── pretrained/
+│   ├── bevfusion-det.pth
+│   ├── lidar-only-det.pth
+│   └── swint-nuimages-pretrained.pth
+├── data/nuscenes/
+│   ├── nuscenes_infos_{train,val}.pkl
+│   ├── nuscenes_dbinfos_train.pkl
+│   └── nuscenes_gt_database/
+├── tools/test.py          # Val（含 L20X 兼容）
+├── tools/train.py         # 训练（含 sm90_compat）
+├── mmdet3d/utils/sm90_compat.py
+└── docs/L20X_部署指南.md  # 本文档
+```
+
+---
+
+*文档基于 L20X 实测整理，如有新坑欢迎补充。*
